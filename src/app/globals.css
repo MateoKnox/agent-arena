@@ -1,15 +1,66 @@
 @import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+:root {
+  --stone-dark: #0d0b08;
+  --stone-mid: #1a1208;
+  --stone-light: #2d1f0e;
+  --stone-border: #3d2b14;
+  --amber: #ff8c00;
+  --amber-light: #ffaa33;
+  --blood: #8b0000;
+  --blood-bright: #cc2200;
+  --text: #e8d5a0;
+  --text-dim: #7a6040;
+}
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
-  background: #0a0a0a;
-  color: #e0e0e0;
-  font-family: 'Courier New', monospace;
+  background: var(--stone-dark);
+  color: var(--text);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 10px;
   overflow: hidden;
   height: 100vh;
+  image-rendering: pixelated;
 }
 
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: #111; }
-::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--stone-mid); }
+::-webkit-scrollbar-thumb { background: var(--amber); }
+
+.pixel-border {
+  border: 2px solid var(--amber);
+  box-shadow: inset 0 0 0 1px var(--stone-border), 0 0 8px rgba(255,140,0,0.2);
+}
+
+.pixel-btn {
+  background: var(--amber);
+  color: #000;
+  border: none;
+  padding: 8px 12px;
+  font-family: 'Press Start 2P', monospace;
+  font-size: 8px;
+  cursor: pointer;
+  image-rendering: pixelated;
+  transition: background 0.1s;
+  box-shadow: 3px 3px 0 #7a4400;
+}
+
+.pixel-btn:hover { background: var(--amber-light); }
+.pixel-btn:active { transform: translate(2px, 2px); box-shadow: 1px 1px 0 #7a4400; }
+.pixel-btn:disabled { background: #333; color: #666; box-shadow: none; cursor: not-allowed; }
+
+.pixel-input {
+  background: var(--stone-dark);
+  border: 2px solid var(--stone-border);
+  color: var(--text);
+  padding: 6px 8px;
+  font-family: 'Press Start 2P', monospace;
+  font-size: 8px;
+  outline: none;
+  width: 100%;
+}
+
+.pixel-input:focus { border-color: var(--amber); }

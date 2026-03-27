@@ -1,22 +1,58 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
-import { Agent, FightEvent, GameState, ARENA_WIDTH, ARENA_HEIGHT, AGENT_SIZE, FightingStyle } from "@/lib/gameTypes";
+import { Agent, FightEvent, GameState, ARENA_WIDTH, ARENA_HEIGHT, FightingStyle } from "@/lib/gameTypes";
+import { SPRITES, getCharacterClass, drawSprite, CharClass } from "@/lib/sprites";
 
-const STYLES: { value: FightingStyle; label: string; desc: string; color: string }[] = [
-  { value: "aggressive", label: "⚔ Aggressive", desc: "Pure offense, attacks on sight", color: "#ff4444" },
-  { value: "strategic", label: "🧠 Strategic", desc: "Calculated moves, picks fights wisely", color: "#44aaff" },
-  { value: "deceptive", label: "🎭 Deceptive", desc: "Tricks and feints, strikes when least expected", color: "#aa44ff" },
-  { value: "defensive", label: "🛡 Defensive", desc: "Hard to kill, waits for mistakes", color: "#44ff88" },
-  { value: "chaotic", label: "💀 Chaotic", desc: "Unpredictable. Even we don't know.", color: "#ffaa00" },
+const SCALE = 3;
+const SPRITE_PX = 16 * SCALE;
+
+const STYLE_OPTIONS: { value: FightingStyle; label: string; charClass: CharClass; desc: string }[] = [
+  { value: "aggressive", label: "WARRIOR", charClass: "WARRIOR", desc: "Pure offense" },
+  { value: "strategic",  label: "MAGE",    charClass: "MAGE",    desc: "Calculated strikes" },
+  { value: "deceptive",  label: "ROGUE",   charClass: "ROGUE",   desc: "Strike from shadows" },
+  { value: "defensive",  label: "PALADIN", charClass: "PALADIN", desc: "Unbreakable defense" },
+  { value: "chaotic",    label: "VOID",    charClass: "VOID",    desc: "Pure chaos" },
 ];
+
+interface BloodSplat { x: number; y: number; pixels: {dx: number; dy: number; color: string}[]; alpha: number; }
+interface ClashEffect { x: number; y: number; frame: number; }
+
+// Pre-render sprite frames to offscreen canvases for perf
+function prerenderSprites() {
+  const cache: Record<string, HTMLCanvasElement> = {};
+  for (const [cls, data] of Object.entries(SPRITES)) {
+    for (const [frameName, frame] of Object.entries(data)) {
+      if (!Array.isArray(frame)) continue;
+      const key = `${cls}_${frameName}`;
+      const c = document.createElement("canvas");
+      c.width = SPRITE_PX; c.height = SPRITE_PX;
+      const ctx = c.getContext("2d")!;
+      drawSprite(ctx, frame as string[][], 0, 0, SCALE);
+      cache[key] = c;
+
+      // Flipped
+      const cf = document.createElement("canvas");
+      cf.width = SPRITE_PX; cf.height = SPRITE_PX;
+      const ctxf = cf.getContext("2d")!;
+      drawSprite(ctxf, frame as string[][], 0, 0, SCALE, true);
+      cache[`${key}_flip`] = cf;
+    }
+  }
+  return cache;
+}
 
 export default function Arena() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<Socket | null>(null);
   const agentsRef = useRef<Record<string, Agent>>({});
   const fightLogRef = useRef<FightEvent[]>([]);
-  const animFrameRef = useRef<number>(0);
+  const animRef = useRef<number>(0);
+  const tickRef = useRef(0);
+  const spriteCache = useRef<Record<string, HTMLCanvasElement>>({});
+  const bloodSplats = useRef<BloodSplat[]>([]);
+  const clashEffects = useRef<ClashEffect[]>([]);
+  const torchPhase = useRef(0);
 
   const [connected, setConnected] = useState(false);
   const [myAgentId, setMyAgentId] = useState<string | null>(null);
@@ -24,136 +60,200 @@ export default function Arena() {
   const [recentFights, setRecentFights] = useState<FightEvent[]>([]);
   const [name, setName] = useState("");
   const [style, setStyle] = useState<FightingStyle>("aggressive");
-  const [prompt, setPrompt] = useState("");
   const [joining, setJoining] = useState(false);
   const [agentCount, setAgentCount] = useState(0);
+  const [totalKills, setTotalKills] = useState(0);
 
   const updateLeaderboard = useCallback(() => {
     const agents = Object.values(agentsRef.current);
     setLeaderboard([...agents].sort((a, b) => b.kills - a.kills).slice(0, 10));
     setAgentCount(agents.length);
+    setTotalKills(agents.reduce((s, a) => s + a.kills, 0));
   }, []);
 
-  const draw = useCallback(() => {
+  const drawArena = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Background
-    ctx.fillStyle = "#0a0a0a";
-    ctx.fillRect(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
+    tickRef.current++;
+    torchPhase.current += 0.08;
+    const t = torchPhase.current;
 
-    // Grid
-    ctx.strokeStyle = "rgba(255,255,255,0.03)";
+    // === FLOOR ===
+    for (let tx = 0; tx < ARENA_WIDTH; tx += 40) {
+      for (let ty = 0; ty < ARENA_HEIGHT; ty += 40) {
+        const checker = ((tx + ty) / 40) % 2 === 0;
+        ctx.fillStyle = checker ? "#1a1a18" : "#141412";
+        ctx.fillRect(tx, ty, 40, 40);
+      }
+    }
+
+    // Floor cracks
+    ctx.strokeStyle = "rgba(0,0,0,0.3)";
     ctx.lineWidth = 1;
-    for (let x = 0; x < ARENA_WIDTH; x += 40) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, ARENA_HEIGHT); ctx.stroke();
-    }
-    for (let y = 0; y < ARENA_HEIGHT; y += 40) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(ARENA_WIDTH, y); ctx.stroke();
-    }
+    [[80,120,200,180],[300,50,350,150],[500,200,520,300],[700,100,680,250],
+     [150,300,250,280],[400,350,450,400],[600,300,650,350]].forEach(([x1,y1,x2,y2]) => {
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    });
 
-    // Arena border
-    ctx.strokeStyle = "rgba(255,80,80,0.3)";
+    // Arena border - stone wall effect
+    ctx.strokeStyle = "#3d2b14";
+    ctx.lineWidth = 6;
+    ctx.strokeRect(3, 3, ARENA_WIDTH - 6, ARENA_HEIGHT - 6);
+    ctx.strokeStyle = "#5a3d1a";
     ctx.lineWidth = 2;
-    ctx.strokeRect(1, 1, ARENA_WIDTH - 2, ARENA_HEIGHT - 2);
+    ctx.strokeRect(8, 8, ARENA_WIDTH - 16, ARENA_HEIGHT - 16);
 
+    // === CROWD SILHOUETTES ===
+    ctx.fillStyle = "rgba(10,8,5,0.7)";
+    for (let cx = 0; cx < ARENA_WIDTH; cx += 18) {
+      const h = 20 + Math.sin(cx * 0.3) * 8;
+      ctx.fillRect(cx, 0, 16, h);
+      ctx.fillRect(cx, ARENA_HEIGHT - h, 16, h);
+    }
+    for (let cy = 30; cy < ARENA_HEIGHT - 30; cy += 18) {
+      const w = 15 + Math.sin(cy * 0.3) * 6;
+      ctx.fillRect(0, cy, w, 16);
+      ctx.fillRect(ARENA_WIDTH - w, cy, w, 16);
+    }
+
+    // === TORCHES (corners) ===
+    const torchPositions = [[30, 30], [ARENA_WIDTH - 30, 30], [30, ARENA_HEIGHT - 30], [ARENA_WIDTH - 30, ARENA_HEIGHT - 30]];
+    torchPositions.forEach(([tx2, ty2]) => {
+      const flicker = 0.7 + Math.sin(t + tx2) * 0.3;
+      // Glow
+      const grad = ctx.createRadialGradient(tx2, ty2, 0, tx2, ty2, 35 * flicker);
+      grad.addColorStop(0, `rgba(255,140,0,${0.4 * flicker})`);
+      grad.addColorStop(1, "rgba(255,60,0,0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(tx2 - 35, ty2 - 35, 70, 70);
+      // Flame
+      ctx.fillStyle = `rgba(255,${Math.floor(120 + Math.sin(t * 3) * 40)},0,${flicker})`;
+      ctx.fillRect(tx2 - 3, ty2 - 8, 6, 8);
+      ctx.fillStyle = `rgba(255,200,0,${flicker * 0.8})`;
+      ctx.fillRect(tx2 - 2, ty2 - 10, 4, 6);
+      // Torch body
+      ctx.fillStyle = "#5a3000";
+      ctx.fillRect(tx2 - 2, ty2, 4, 10);
+    });
+
+    // === BLOOD SPLATS ===
+    bloodSplats.current = bloodSplats.current.filter(b => b.alpha > 0);
+    bloodSplats.current.forEach(b => {
+      b.alpha -= 0.005;
+      ctx.globalAlpha = b.alpha;
+      b.pixels.forEach(p => {
+        ctx.fillStyle = p.color;
+        ctx.fillRect(b.x + p.dx, b.y + p.dy, 3, 3);
+      });
+      ctx.globalAlpha = 1;
+    });
+
+    // === AGENTS ===
     const agents = Object.values(agentsRef.current);
-
     for (const agent of agents) {
-      const isDead = agent.state === "dead";
+      if (agent.state === "dead") continue;
+
+      const cls = getCharacterClass(agent.style);
+      const sprite = SPRITES[cls];
+      const tick = tickRef.current;
+
+      // Choose frame
+      let frameName = "idle";
+      if (agent.state === "fighting") frameName = "attack";
+      else if (agent.state === "roaming") {
+        frameName = Math.floor(tick / 8) % 2 === 0 ? "walk1" : "walk2";
+      }
+
+      const cacheKey = `${cls}_${frameName}`;
       const isMe = agent.id === myAgentId;
-      const alpha = isDead ? 0.2 : 1;
 
-      ctx.globalAlpha = alpha;
+      // Facing direction
+      const target = agent.targetId ? agentsRef.current[agent.targetId] : null;
+      const facingLeft = target ? target.x < agent.x : false;
+      const finalKey = facingLeft ? `${cacheKey}_flip` : cacheKey;
 
-      // Glow for my agent
-      if (isMe && !isDead) {
-        ctx.shadowColor = agent.color;
-        ctx.shadowBlur = 16;
+      const cached = spriteCache.current[finalKey];
+      const drawX = agent.x - SPRITE_PX / 2;
+      const drawY = agent.y - SPRITE_PX / 2;
+
+      // My agent glow
+      if (isMe) {
+        ctx.shadowColor = sprite.color;
+        ctx.shadowBlur = 12;
       }
 
-      // Agent body (pixel character)
-      const s = AGENT_SIZE;
-      const x = Math.round(agent.x);
-      const y = Math.round(agent.y);
-
-      // Body
-      ctx.fillStyle = agent.color;
-      ctx.fillRect(x - s/2, y - s/2, s, s);
-
-      // Pixel face
-      ctx.fillStyle = "#000";
-      ctx.fillRect(x - 3, y - 3, 2, 2); // left eye
-      ctx.fillRect(x + 1, y - 3, 2, 2); // right eye
-
-      if (agent.state === "fighting") {
-        ctx.fillStyle = "#ff0";
-        ctx.fillRect(x - 2, y + 1, 4, 1); // angry mouth
-      } else {
-        ctx.fillStyle = "#000";
-        ctx.fillRect(x - 2, y + 2, 4, 1); // normal mouth
+      if (cached) {
+        ctx.globalAlpha = 1;
+        ctx.drawImage(cached, drawX, drawY);
       }
-
       ctx.shadowBlur = 0;
 
-      // HP bar
-      if (!isDead) {
-        const barW = 28;
-        const barH = 3;
-        const bx = x - barW/2;
-        const by = y - s/2 - 7;
-        ctx.fillStyle = "#333";
-        ctx.fillRect(bx, by, barW, barH);
-        ctx.fillStyle = agent.hp > 50 ? "#44ff44" : agent.hp > 25 ? "#ffaa00" : "#ff4444";
-        ctx.fillRect(bx, by, (agent.hp / agent.maxHp) * barW, barH);
-      }
+      // === HP BAR ===
+      const barW = SPRITE_PX;
+      const barH = 4;
+      const bx = drawX;
+      const by = drawY - 12;
+      ctx.fillStyle = "#1a0000";
+      ctx.fillRect(bx, by, barW, barH);
+      const hpColor = agent.hp > 60 ? "#00cc44" : agent.hp > 30 ? "#ffaa00" : "#cc0000";
+      ctx.fillStyle = hpColor;
+      ctx.fillRect(bx, by, (agent.hp / agent.maxHp) * barW, barH);
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx, by, barW, barH);
 
-      // Name tag
-      ctx.globalAlpha = isDead ? 0.3 : 1;
-      ctx.fillStyle = isMe ? "#fff" : agent.color;
-      ctx.font = `${isMe ? "bold " : ""}8px 'Courier New'`;
+      // === NAME TAG ===
+      ctx.fillStyle = isMe ? "#ffffff" : "#e8d5a0";
+      ctx.font = `6px 'Press Start 2P', monospace`;
       ctx.textAlign = "center";
-      ctx.fillText(agent.name.slice(0, 10), x, y - s/2 - 10);
+      ctx.fillText(agent.name.slice(0, 8), agent.x, drawY - 15);
 
-      // Kill count badge
-      if (agent.kills > 0 && !isDead) {
-        ctx.fillStyle = "#ff4444";
-        ctx.font = "bold 8px 'Courier New'";
-        ctx.fillText(`${agent.kills}☠`, x + s/2 + 2, y - s/2);
+      // === KILL BADGE ===
+      if (agent.kills > 0) {
+        ctx.fillStyle = "#cc0000";
+        ctx.font = `6px 'Press Start 2P', monospace`;
+        ctx.textAlign = "left";
+        ctx.fillText(`☠${agent.kills}`, drawX + SPRITE_PX + 1, drawY + 8);
       }
-
-      // Fighting flash
-      if (agent.state === "fighting") {
-        ctx.strokeStyle = "#ffff00";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(x - s/2 - 2, y - s/2 - 2, s + 4, s + 4);
-      }
-
-      // Dead X
-      if (isDead) {
-        ctx.strokeStyle = "#ff4444";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(x - s/2, y - s/2); ctx.lineTo(x + s/2, y + s/2);
-        ctx.moveTo(x + s/2, y - s/2); ctx.lineTo(x - s/2, y + s/2);
-        ctx.stroke();
-      }
-
-      ctx.globalAlpha = 1;
     }
 
-    // Arena title
-    ctx.fillStyle = "rgba(255,50,50,0.15)";
-    ctx.font = "bold 48px 'Courier New'";
-    ctx.textAlign = "center";
-    ctx.fillText("AGENT ARENA", ARENA_WIDTH/2, ARENA_HEIGHT/2 + 16);
+    // === CLASH EFFECTS ===
+    clashEffects.current = clashEffects.current.filter(e => e.frame < 20);
+    clashEffects.current.forEach(e => {
+      e.frame++;
+      const progress = e.frame / 20;
+      const radius = progress * 30;
+      ctx.globalAlpha = 1 - progress;
+      // Star burst
+      for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        const px = e.x + Math.cos(angle) * radius;
+        const py = e.y + Math.sin(angle) * radius;
+        ctx.fillStyle = e.frame < 5 ? "#ffffff" : "#ffaa00";
+        ctx.fillRect(px - 2, py - 2, 4, 4);
+      }
+      ctx.globalAlpha = 1 - progress;
+      ctx.fillStyle = "#ffff00";
+      ctx.fillRect(e.x - 3, e.y - 3, 6, 6);
+      ctx.globalAlpha = 1;
+    });
 
-    animFrameRef.current = requestAnimationFrame(draw);
+    // Arena title watermark
+    ctx.globalAlpha = 0.04;
+    ctx.fillStyle = "#ff8c00";
+    ctx.font = "bold 60px 'Press Start 2P', monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("ARENA", ARENA_WIDTH / 2, ARENA_HEIGHT / 2 + 20);
+    ctx.globalAlpha = 1;
+
+    animRef.current = requestAnimationFrame(drawArena);
   }, [myAgentId]);
 
   useEffect(() => {
+    spriteCache.current = prerenderSprites();
     const socket = io("http://localhost:3001");
     socketRef.current = socket;
 
@@ -170,6 +270,21 @@ export default function Arena() {
     socket.on("tick", ({ agents, newFights }: { agents: Record<string, Agent>; newFights: FightEvent[] }) => {
       agentsRef.current = agents;
       if (newFights.length > 0) {
+        // Add blood + clash effects
+        newFights.forEach(f => {
+          const loser = agents[f.winnerId === f.attackerId ? f.defenderId : f.attackerId];
+          if (loser) {
+            bloodSplats.current.push({
+              x: loser.x, y: loser.y, alpha: 1,
+              pixels: Array.from({ length: 20 }, () => ({
+                dx: (Math.random() - 0.5) * 40,
+                dy: (Math.random() - 0.5) * 40,
+                color: Math.random() > 0.3 ? "#8b0000" : "#cc0000",
+              })),
+            });
+            clashEffects.current.push({ x: loser.x, y: loser.y, frame: 0 });
+          }
+        });
         fightLogRef.current = [...newFights, ...fightLogRef.current].slice(0, 50);
         setRecentFights([...fightLogRef.current].slice(0, 20));
       }
@@ -181,130 +296,177 @@ export default function Arena() {
       setJoining(false);
     });
 
-    animFrameRef.current = requestAnimationFrame(draw);
+    animRef.current = requestAnimationFrame(drawArena);
     return () => {
       socket.disconnect();
-      cancelAnimationFrame(animFrameRef.current);
+      cancelAnimationFrame(animRef.current);
     };
-  }, [draw, updateLeaderboard]);
+  }, [drawArena, updateLeaderboard]);
 
   function joinArena() {
     if (!name.trim() || !socketRef.current) return;
     setJoining(true);
-    socketRef.current.emit("join", { name: name.trim(), style, prompt: prompt || `Fight ${style}ly` });
+    socketRef.current.emit("join", { name: name.trim(), style, prompt: `Fight as a ${style} ${getCharacterClass(style)}` });
   }
 
   const myAgent = myAgentId ? agentsRef.current[myAgentId] : null;
+  const selectedStyle = STYLE_OPTIONS.find(s => s.value === style)!;
 
   return (
-    <div className="flex h-screen bg-[#0a0a0a] overflow-hidden">
-      {/* Left panel */}
-      <div className="w-56 flex-shrink-0 flex flex-col border-r border-[#1a1a1a] overflow-hidden">
-        {/* Header */}
-        <div className="p-3 border-b border-[#1a1a1a]">
-          <div className="text-[#ff4444] font-bold text-sm tracking-widest">⚔ AGENT ARENA</div>
-          <div className="flex items-center gap-2 mt-1">
-            <div className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-green-400" : "bg-red-500"}`} />
-            <span className="text-xs text-[#444]">{connected ? `${agentCount} agents` : "connecting..."}</span>
-          </div>
-        </div>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: "#0d0b08", overflow: "hidden" }}>
 
-        {/* Join form */}
-        {!myAgentId ? (
-          <div className="p-3 border-b border-[#1a1a1a] flex flex-col gap-2">
-            <div className="text-xs text-[#666] tracking-widest mb-1">ENTER ARENA</div>
-            <input
-              value={name}
-              onChange={e => setName(e.target.value)}
-              placeholder="Agent name"
-              maxLength={16}
-              className="bg-[#111] border border-[#222] rounded px-2 py-1.5 text-xs text-white placeholder-[#333] focus:border-[#ff4444] outline-none w-full"
-            />
-            <div className="flex flex-col gap-1">
-              {STYLES.map(s => (
-                <button key={s.value}
-                  onClick={() => setStyle(s.value)}
-                  className={`text-left px-2 py-1.5 rounded text-xs border transition-all ${style === s.value ? "border-[#333] bg-[#1a1a1a]" : "border-transparent hover:border-[#222]"}`}
-                  style={{ color: style === s.value ? s.color : "#555" }}>
-                  {s.label}
-                </button>
-              ))}
-            </div>
-            <textarea
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              placeholder="Custom strategy (optional)"
-              rows={2}
-              className="bg-[#111] border border-[#222] rounded px-2 py-1.5 text-xs text-white placeholder-[#333] focus:border-[#ff4444] outline-none resize-none w-full"
-            />
-            <button
-              onClick={joinArena}
-              disabled={!name.trim() || joining || !connected}
-              className="bg-[#ff4444] hover:bg-[#ff2222] disabled:bg-[#331111] disabled:text-[#550000] text-white text-xs font-bold py-2 rounded tracking-widest transition-colors">
-              {joining ? "ENTERING..." : "ENTER ARENA"}
-            </button>
-          </div>
-        ) : myAgent ? (
-          <div className="p-3 border-b border-[#1a1a1a]">
-            <div className="text-xs text-[#666] tracking-widest mb-2">YOUR AGENT</div>
-            <div className="font-bold text-sm" style={{ color: myAgent.color }}>{myAgent.name}</div>
-            <div className="text-xs text-[#444] mt-1">{myAgent.style}</div>
-            <div className="flex gap-3 mt-2 text-xs">
-              <div><span className="text-[#ff4444]">☠ {myAgent.kills}</span> kills</div>
-              <div><span className="text-[#444]">{myAgent.deaths}</span> deaths</div>
-            </div>
-            <div className="mt-2">
-              <div className="w-full bg-[#111] rounded h-1.5">
-                <div className="h-1.5 rounded transition-all" style={{ width: `${myAgent.hp}%`, background: myAgent.hp > 50 ? "#44ff44" : myAgent.hp > 25 ? "#ffaa00" : "#ff4444" }} />
-              </div>
-              <div className="text-xs text-[#333] mt-0.5">{myAgent.hp}/100 HP {myAgent.state === "dead" ? "· RESPAWNING" : ""}</div>
-            </div>
-          </div>
-        ) : null}
-
-        {/* Leaderboard */}
-        <div className="flex-1 overflow-y-auto p-3">
-          <div className="text-xs text-[#666] tracking-widest mb-2">LEADERBOARD</div>
-          {leaderboard.map((agent, i) => (
-            <div key={agent.id} className={`flex items-center gap-2 py-1.5 border-b border-[#111] ${agent.id === myAgentId ? "bg-[#111] -mx-3 px-3" : ""}`}>
-              <span className="text-[#333] text-xs w-4">#{i + 1}</span>
-              <div className="w-2 h-2 rounded-sm flex-shrink-0" style={{ background: agent.color }} />
-              <span className="text-xs truncate flex-1" style={{ color: agent.id === myAgentId ? "#fff" : "#888" }}>{agent.name}</span>
-              <span className="text-xs text-[#ff4444] font-bold">{agent.kills}☠</span>
-            </div>
-          ))}
+      {/* TOP BAR */}
+      <div style={{ background: "#1a1208", borderBottom: "2px solid #3d2b14", padding: "6px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+        <div style={{ color: "#ff8c00", fontSize: "12px", letterSpacing: "4px" }}>⚔ AGENT ARENA</div>
+        <div style={{ display: "flex", gap: 24, fontSize: "8px", color: "#7a6040" }}>
+          <span>SEASON <span style={{ color: "#ff8c00" }}>1</span></span>
+          <span>AGENTS: <span style={{ color: "#ffaa33" }}>{agentCount}</span></span>
+          <span>TOTAL KILLS: <span style={{ color: "#cc2200" }}>{totalKills}</span></span>
+          <span style={{ color: connected ? "#44ff44" : "#ff4444" }}>{connected ? "● LIVE" : "● OFFLINE"}</span>
         </div>
       </div>
 
-      {/* Canvas */}
-      <div className="flex-1 flex items-center justify-center bg-[#050505] relative overflow-hidden">
-        <canvas
-          ref={canvasRef}
-          width={ARENA_WIDTH}
-          height={ARENA_HEIGHT}
-          style={{ imageRendering: "pixelated", maxWidth: "100%", maxHeight: "100%" }}
-        />
-      </div>
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
 
-      {/* Right panel — fight log */}
-      <div className="w-56 flex-shrink-0 border-l border-[#1a1a1a] flex flex-col overflow-hidden">
-        <div className="p-3 border-b border-[#1a1a1a]">
-          <div className="text-xs text-[#666] tracking-widest">FIGHT LOG</div>
-        </div>
-        <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
-          {recentFights.map(f => (
-            <div key={f.id} className="border border-[#1a1a1a] rounded p-2 bg-[#0d0d0d]">
-              <div className="text-xs text-[#666] mb-1">
-                <span style={{ color: agentsRef.current[f.winnerId]?.color || "#fff" }}>{f.winnerId === f.attackerId ? f.attackerName : f.defenderName}</span>
-                <span className="text-[#333]"> killed </span>
-                <span className="text-[#444]">{f.winnerId === f.attackerId ? f.defenderName : f.attackerName}</span>
+        {/* LEFT PANEL */}
+        <div style={{ width: 220, flexShrink: 0, background: "#140f07", borderRight: "2px solid #3d2b14", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+          {/* Join / My Agent */}
+          {!myAgentId ? (
+            <div style={{ padding: 12, borderBottom: "2px solid #3d2b14" }}>
+              <div style={{ color: "#ff8c00", fontSize: "8px", letterSpacing: "2px", marginBottom: 10 }}>ENTER THE ARENA</div>
+              <input
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Your name..."
+                maxLength={12}
+                className="pixel-input"
+                style={{ marginBottom: 8 }}
+              />
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                {STYLE_OPTIONS.map(opt => {
+                  const sp = SPRITES[opt.charClass];
+                  return (
+                    <button key={opt.value}
+                      onClick={() => setStyle(opt.value)}
+                      style={{
+                        background: style === opt.value ? "#2d1f0e" : "transparent",
+                        border: style === opt.value ? `1px solid ${sp.color}` : "1px solid #2d1f0e",
+                        color: style === opt.value ? sp.color : "#5a4030",
+                        padding: "5px 8px",
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        fontSize: "7px",
+                        fontFamily: "'Press Start 2P', monospace",
+                        textAlign: "left",
+                        transition: "all 0.1s",
+                      }}>
+                      <div style={{ width: 8, height: 8, background: sp.color, flexShrink: 0, boxShadow: style === opt.value ? `0 0 6px ${sp.color}` : "none" }} />
+                      <div>
+                        <div>{opt.label}</div>
+                        <div style={{ color: "#3d2b14", fontSize: "6px" }}>{opt.desc}</div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
-              <div className="text-xs text-[#333] leading-relaxed">{f.narrative}</div>
+              <button
+                className="pixel-btn"
+                onClick={joinArena}
+                disabled={!name.trim() || joining || !connected}
+                style={{ width: "100%", fontSize: "7px" }}>
+                {joining ? "ENTERING..." : "ENTER ARENA"}
+              </button>
             </div>
-          ))}
-          {recentFights.length === 0 && (
-            <div className="text-xs text-[#222] text-center mt-8">Waiting for first blood...</div>
-          )}
+          ) : myAgent ? (
+            <div style={{ padding: 12, borderBottom: "2px solid #3d2b14" }}>
+              <div style={{ color: "#ff8c00", fontSize: "8px", letterSpacing: "2px", marginBottom: 8 }}>YOUR FIGHTER</div>
+              <div style={{ color: SPRITES[getCharacterClass(myAgent.style)].color, fontSize: "10px", marginBottom: 4 }}>{myAgent.name}</div>
+              <div style={{ color: "#5a4030", fontSize: "7px", marginBottom: 8 }}>{getCharacterClass(myAgent.style)}</div>
+              <div style={{ display: "flex", gap: 12, fontSize: "8px", marginBottom: 8 }}>
+                <span style={{ color: "#cc2200" }}>☠ {myAgent.kills}</span>
+                <span style={{ color: "#5a4030" }}>✝ {myAgent.deaths}</span>
+                <span style={{ color: myAgent.kills + myAgent.deaths > 0 ? "#ffaa33" : "#5a4030" }}>
+                  {myAgent.deaths > 0 ? (myAgent.kills / myAgent.deaths).toFixed(1) : myAgent.kills.toFixed(1)} K/D
+                </span>
+              </div>
+              <div style={{ background: "#0d0b08", height: 6, width: "100%", border: "1px solid #2d1f0e" }}>
+                <div style={{ height: "100%", background: myAgent.hp > 60 ? "#00cc44" : myAgent.hp > 30 ? "#ffaa00" : "#cc0000", width: `${myAgent.hp}%`, transition: "width 0.3s" }} />
+              </div>
+              <div style={{ color: "#3d2b14", fontSize: "6px", marginTop: 4 }}>
+                {myAgent.state === "dead" ? "RESPAWNING..." : `${myAgent.hp}/100 HP`}
+              </div>
+            </div>
+          ) : null}
+
+          {/* Leaderboard */}
+          <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+            <div style={{ color: "#ff8c00", fontSize: "7px", letterSpacing: "2px", marginBottom: 8 }}>LEADERBOARD</div>
+            {leaderboard.map((agent, i) => {
+              const cls = getCharacterClass(agent.style);
+              const sp = SPRITES[cls];
+              return (
+                <div key={agent.id} style={{
+                  display: "flex", alignItems: "center", gap: 6,
+                  padding: "4px 0",
+                  borderBottom: "1px solid #1a1208",
+                  background: agent.id === myAgentId ? "#1a1208" : "transparent",
+                }}>
+                  <span style={{ color: "#3d2b14", fontSize: "6px", width: 14 }}>#{i + 1}</span>
+                  <div style={{ width: 6, height: 6, background: sp.color, flexShrink: 0, boxShadow: `0 0 4px ${sp.color}` }} />
+                  <span style={{ fontSize: "6px", flex: 1, color: agent.id === myAgentId ? "#fff" : "#7a6040", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.name}</span>
+                  <span style={{ fontSize: "7px", color: "#cc2200", fontWeight: "bold" }}>☠{agent.kills}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ARENA CANVAS */}
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0806", overflow: "hidden" }}>
+          <canvas
+            ref={canvasRef}
+            width={ARENA_WIDTH}
+            height={ARENA_HEIGHT}
+            style={{ imageRendering: "pixelated", maxWidth: "100%", maxHeight: "100%", border: "3px solid #3d2b14", boxShadow: "0 0 30px rgba(0,0,0,0.8)" }}
+          />
+        </div>
+
+        {/* RIGHT PANEL - FIGHT LOG */}
+        <div style={{ width: 220, flexShrink: 0, background: "#140f07", borderLeft: "2px solid #3d2b14", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ padding: 12, borderBottom: "2px solid #3d2b14" }}>
+            <div style={{ color: "#ff8c00", fontSize: "7px", letterSpacing: "2px" }}>⚔ KILL FEED</div>
+          </div>
+          <div style={{ flex: 1, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+            {recentFights.map(f => {
+              const winnerAgent = agentsRef.current[f.winnerId];
+              const winnerCls = winnerAgent ? getCharacterClass(winnerAgent.style) : "WARRIOR";
+              const winnerColor = SPRITES[winnerCls].color;
+              return (
+                <div key={f.id} style={{
+                  background: "#0d0b08",
+                  border: "1px solid #2d1f0e",
+                  padding: "6px 8px",
+                  fontSize: "6px",
+                  lineHeight: "1.6",
+                }}>
+                  <div style={{ marginBottom: 3 }}>
+                    <span style={{ color: winnerColor }}>{f.winnerId === f.attackerId ? f.attackerName : f.defenderName}</span>
+                    <span style={{ color: "#cc0000" }}> ☠ </span>
+                    <span style={{ color: "#5a4030" }}>{f.winnerId === f.attackerId ? f.defenderName : f.attackerName}</span>
+                  </div>
+                  <div style={{ color: "#3d2b14", fontStyle: "italic" }}>{f.narrative}</div>
+                </div>
+              );
+            })}
+            {recentFights.length === 0 && (
+              <div style={{ color: "#2d1f0e", fontSize: "7px", textAlign: "center", marginTop: 30 }}>
+                Waiting for<br />first blood...
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
